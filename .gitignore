@@ -1,0 +1,23 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment variables (may hold secrets/config you don't want to share)
+.env
+
+# This tool's own output — JSONL audit logs can contain OAuth exchange
+# details (masked, but still not something to commit)
+*.jsonl
+
+# OS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
