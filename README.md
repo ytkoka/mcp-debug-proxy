@@ -11,6 +11,11 @@ watch exactly what an MCP client and a remote MCP server say to each other,
 including the OAuth dance, without needing a packet sniffer or a debugger
 inside the client.
 
+This is **not** a transport-conversion proxy (stdio↔HTTP bridges like
+`mcp-remote` already do that well) — its only job is to make MCP + OAuth
+traffic observable by logging it, unmodified in substance, as it passes
+through.
+
 ## Requirements
 
 - Python 3.9+
@@ -38,6 +43,7 @@ config file to edit.
 | `UPSTREAM`     | `https://mcp.example.com/mcp`  | The remote MCP server you want to watch (its full endpoint URL). |
 | `PROXY_PUBLIC` | `http://localhost:8080`        | The base URL clients use to reach this proxy. Only change this if you're not running on `localhost:8080` (e.g. behind an SSH tunnel on a different port). |
 | `LOG_PATH`     | `mcp_proxy.jsonl`               | Where the JSONL audit log is written.                            |
+| `ALLOWED_AUTH_HOSTS` | *(unset)*                | Comma-separated IdP hosts to allow through `/_up/{host}` in addition to the ones OAuth discovery hands out at runtime. Useful so a client that skips discovery after a proxy restart (e.g. reusing a cached refresh token) doesn't get a spurious 403. `UPSTREAM`'s own host is always allowed. |
 
 ## Running
 
@@ -54,6 +60,11 @@ what the local bridge below expects. By default uvicorn binds to
 `127.0.0.1` only; there's no authentication on the proxy's own port, so
 don't pass `--host 0.0.0.0` unless you know what you're doing (see
 [Known limitations](#known-limitations)).
+
+Run with a single worker (the default — don't pass `--workers N`). The
+`/_up/{host}` allowlist lives in process memory, so multiple worker
+processes wouldn't share it and requests could hit a worker that never saw
+the discovery traffic that unlocked a given host.
 
 Tail the log while you work:
 
@@ -86,12 +97,22 @@ Claude Desktop ─stdio─► mcp-remote (local) ─HTTP─► proxy ─https─
 }
 ```
 
-The OAuth authorize leg opens in your browser straight to the IdP (not logged);
-DCR and token exchange flow through the proxy and are logged. The proxy
+The OAuth authorize leg opens in your browser, bounces once through the proxy
+(logged) to fix up the `resource` param, then goes straight to the IdP for
+the actual login (not logged) — see [How the OAuth interception
+works](#how-the-oauth-interception-works). DCR and token exchange flow
+through the proxy and are logged. The proxy
 rewrites the `Origin`/`Referer` headers to the upstream origin so servers that
-do DNS-rebinding/Origin validation don't reject the relayed request. It does
-**not** touch the OAuth `resource` value, so the token audience stays bound to
-the real server and the IdP accepts it.
+do DNS-rebinding/Origin validation don't reject the relayed request. The
+client-facing OAuth `resource` value is the proxy's own URL (required for
+clients that validate it against the URL they're connected to), but it's
+patched back to the real server's URL on every request that actually reaches
+the IdP, so the token audience stays bound to the real server and the IdP
+accepts it — see the `resource` section below for why this needs two faces.
+
+Verified end-to-end against a real remote MCP server + IdP (AWS's MCP
+Server, `aws-mcp.us-east-1.api.aws`) — RFC 8414/9728 discovery, DCR, browser
+authorization, and token exchange all worked through the proxy.
 
 ### Kiro
 
@@ -104,25 +125,57 @@ directly at the proxy in `.kiro/settings/mcp.json`:
 
 ## How the OAuth interception works
 
-The proxy rewrites discovery metadata so each leg routes back through it,
-**except** the browser `/authorize` leg, which must go straight to the IdP.
+The proxy rewrites discovery metadata so each leg routes back through it.
+The browser `/authorize` leg still ends up talking to the IdP directly for
+the actual login UI — we only bounce it through a one-shot redirect first
+(see below), we don't proxy the page content.
 
 ```
 client ── GET /              ─► proxy ─► MCP server        401 + WWW-Authenticate
        ◄─ resource_metadata rewritten to proxy ───────────┘
-client ── GET PR metadata    ─► proxy   (authorization_servers rewritten)
-client ── GET AS metadata    ─► proxy   (token/registration rewritten,
-                                         authorization_endpoint left as-is)
+client ── GET PR metadata    ─► proxy   (authorization_servers + resource rewritten)
+client ── GET AS metadata    ─► proxy   (token/registration/authorization_endpoint
+                                         all rewritten)
 client ── POST /register     ─► proxy ─► IdP    (DCR logged)
-browser ─ GET /authorize     ─► IdP            (DIRECT — not logged)
-client ── POST /token        ─► proxy ─► IdP    (code + tokens logged, masked)
+browser ─ GET /_authorize    ─► proxy   (302, `resource` patched back to real value)
+browser ─ GET /authorize     ─► IdP            (DIRECT from here — not logged)
+client ── POST /token        ─► proxy ─► IdP    (`resource` patched back; code +
+                                                  tokens logged, masked)
 client ── POST / (tools/call)─► proxy ─► MCP    (tool name + args logged)
 ```
 
 Auth-server legs are proxied via `/_up/{host}/{path}`, so one proxy can reach
 both the MCP host and its IdP. Only hosts the proxy itself has already handed
 out through this rewriting are allowed through `/_up` — unknown hosts get a
-403 (see [Known limitations](#known-limitations)).
+403 (see [Known limitations](#known-limitations)). `handle_root` also
+recognizes `/.well-known/xxx/_up/{host}/{rest}` — the shape an MCP client
+gets when it applies RFC 8414 path-insertion to one of our `/_up/{host}`
+issuer URLs — and routes it to the real `{host}` with the well-known prefix
+re-inserted ahead of its real path, instead of treating it as a lookup
+against UPSTREAM's own origin.
+
+**`resource` gets two faces.** MCP clients (e.g. `mcp-remote`) validate the
+protected-resource metadata's `resource` value against the URL they're
+actually connected to — which is us, not the real server — so
+`rewrite_metadata()` rewrites `resource` to `PROXY_PUBLIC` for the client.
+But the token the IdP issues still needs to be bound to the *real* server or
+it won't be accepted for actual API calls, so on the way to the real
+`/token` request, `relay()` patches the `resource` form field back to the
+real value it captured earlier. The comparison ignores a trailing `/`, since
+clients don't necessarily echo the value back byte-for-byte (`mcp-remote`
+was observed adding one). Token/DCR request form fields are now also
+logged (masked same as JSON bodies).
+
+The same client-facing `resource` value also ends up in the query string the
+browser sends to `authorization_endpoint` — and some IdPs validate it there
+too (confirmed against AWS's real endpoint: the real `resource` gets a 302,
+the proxy's own URL or a missing `resource` gets a 400). Since that leg goes
+straight from the browser to the IdP and never touches the proxy, there's no
+request to patch — so `rewrite_metadata()` instead points
+`authorization_endpoint` at `{PROXY_PUBLIC}/_authorize`, a one-shot 302
+redirect-bounce (`handle_authorize()`) that patches `resource` and sends the
+browser straight on to the real IdP. The actual login UI is still rendered
+by the real IdP to the browser directly, not relayed through us.
 
 ## Log format
 
@@ -138,6 +191,8 @@ One JSON object per line, e.g. a `tools/call`:
 Secrets (`access_token`, `refresh_token`, `client_secret`, auth `code`,
 `code_verifier`, `Authorization` header) are masked in the log. Tool
 `arguments` are logged in full — scrub these too if they may carry secrets.
+Log files (`*.jsonl`) are gitignored by default so they don't end up in the
+repo by accident.
 
 ## Origin / Referer
 
@@ -156,8 +211,10 @@ values the client actually sent are replaced.
 - **Redirects** are not followed (`follow_redirects=False`) so the client sees
   them verbatim. If the upstream 3xx's to another host you may need to rewrite
   `Location` too.
-- **The `/authorize` browser leg is never captured** (by design). The auth
-  `code` is still visible on the token-exchange request.
+- **The `/authorize` browser leg's login UI is never captured** (by design —
+  only the one-shot redirect-bounce at `/_authorize` is logged, not the
+  actual IdP login page or its cookies/CSP). The auth `code` is still
+  visible on the token-exchange request.
 - **No TLS on the proxy itself** — it listens on plain HTTP for localhost. If a
   client demands https for the MCP URL, terminate TLS in front (caddy/nginx) or
   add a self-signed cert.
@@ -166,17 +223,27 @@ values the client actually sent are replaced.
   use SSH port forwarding rather than exposing it, if you need remote access.
 - **`/_up/{host}` is allowlisted, not open** — it only relays to hosts the
   proxy itself already handed out via `to_proxy_url()` (i.e. hosts seen in
-  protected-resource/AS metadata or a `WWW-Authenticate` challenge). Unknown
-  hosts get a 403, so the debug port can't be used as a general-purpose relay
-  to arbitrary internet hosts.
+  protected-resource/AS metadata or a `WWW-Authenticate` challenge), plus
+  `UPSTREAM`'s own host and anything in `ALLOWED_AUTH_HOSTS`. Unknown hosts
+  get a 403, so the debug port can't be used as a general-purpose relay to
+  arbitrary internet hosts. The allowlist is in-process state — see the
+  single-worker note under [Running](#running).
 - **Single upstream** for the root path. Multi-server fan-out would need a
   routing table.
 - **Log rotation / redaction policy** is not implemented.
 
-## Ideas to build next
+## Testing
 
-- Pretty live TUI instead of tailing JSONL
-- Assertion mode: flag spec violations (missing `WWW-Authenticate`, PKCE not
-  used, `resource` param absent on token request, etc.)
-- Replay a captured session against the server
-- Per-session correlation IDs linking request/response pairs
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements-dev.txt
+pytest
+```
+
+Tests spin up a stub MCP/IdP server and drive the proxy against it (some via
+real localhost sockets, some via an in-process ASGI transport) — no network
+access or real MCP server is needed.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

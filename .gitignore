@@ -15,6 +15,9 @@ env/
 # details (masked, but still not something to commit)
 *.jsonl
 
+# Local planning notes — not for the public repo
+TASKS.md
+
 # OS
 .DS_Store
 

@@ -11,10 +11,12 @@ What is captured:
   - 401 challenge (WWW-Authenticate: resource_metadata=...)
   - protected-resource metadata, authorization-server metadata
   - dynamic client registration (/register)
+  - the one-shot /_authorize redirect-bounce (resource patched, then handed
+    off to the real IdP)
   - token exchange + refresh (/token)
 
 What is NOT captured (by design):
-  - the browser -> IdP /authorize leg (browser hits the IdP directly, not us).
+  - the actual IdP login UI (browser -> IdP, direct, after the bounce above).
     The auth `code` is still visible on the subsequent token-exchange request.
 
 Run:
@@ -26,7 +28,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from urllib.parse import urlsplit, urlunsplit, quote, unquote
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import httpx
 from starlette.applications import Starlette
@@ -60,7 +62,34 @@ _client: httpx.AsyncClient  # set in lifespan
 # Hosts we've pointed the client at via to_proxy_url() (auth-server /_up
 # legs). /_up/{host}/... must only proxy to hosts we ourselves handed out --
 # otherwise it's an open relay to any host for anyone who can reach the port.
-_known_auth_hosts: set[str] = set()
+#
+# This set lives in process memory, so it starts empty on every restart and
+# is per-worker if run with `--workers > 1`. Seed it with UPSTREAM's own host
+# (covers the case where the resource server is also its own AS) and with
+# ALLOWED_AUTH_HOSTS (comma-separated) for IdP hosts you already know about,
+# so a client that skips discovery after a restart (e.g. a cached refresh
+# token) doesn't get a spurious 403.
+_known_auth_hosts: set[str] = {urlsplit(UPSTREAM).netloc}
+for _host in os.environ.get("ALLOWED_AUTH_HOSTS", "").split(","):
+    _host = _host.strip()
+    if _host:
+        _known_auth_hosts.add(_host)
+del _host
+
+# The real `resource` identifier as reported by the upstream's own
+# protected-resource metadata. MCP clients validate `resource` against the
+# URL they're actually connected to (us), so rewrite_metadata() rewrites it
+# to PROXY_PUBLIC -- but the token the IdP issues still needs to be bound to
+# the *real* server, so relay() substitutes this real value back into the
+# `resource` form field on the way to the real /token request.
+_real_resource: str | None = None
+
+# The real authorization_endpoint, captured the same way. The browser hits
+# this directly (never through us), so it also carries the client-facing
+# `resource` value in its query string -- and some IdPs (AWS's included)
+# reject that with a 400 before the user ever sees a login screen. See
+# handle_authorize() for the fix.
+_real_authorization_endpoint: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -127,8 +156,7 @@ def from_proxy_path(host: str, rest: str, query: str) -> str:
 
 
 def rewrite_metadata(doc: dict) -> dict:
-    """Rewrite endpoints we want to intercept; leave the browser-facing
-    authorization_endpoint pointing straight at the IdP."""
+    """Rewrite endpoints we want to intercept."""
     for key in ("token_endpoint", "registration_endpoint", "userinfo_endpoint",
                 "introspection_endpoint", "revocation_endpoint"):
         if isinstance(doc.get(key), str):
@@ -140,7 +168,53 @@ def rewrite_metadata(doc: dict) -> dict:
             to_proxy_url(u) if isinstance(u, str) else u
             for u in doc["authorization_servers"]
         ]
+    if isinstance(doc.get("resource"), str):
+        # MCP clients validate `resource` against the URL they're actually
+        # connected to (us), so it must say PROXY_PUBLIC here. patch_resource()
+        # substitutes the real value back in on the real /token request so
+        # the IdP still binds the issued token to the real server.
+        global _real_resource
+        _real_resource = doc["resource"]
+        doc["resource"] = PROXY_PUBLIC
+    if isinstance(doc.get("authorization_endpoint"), str):
+        # The browser hits this directly -- we don't proxy the interactive
+        # login UI itself (cookies/CSP break across the origin change) -- but
+        # its query string carries the same client-facing `resource` value,
+        # which some IdPs reject outright. Point the client at a redirect-
+        # bounce on the proxy instead: handle_authorize() patches `resource`
+        # and 302s straight to the real endpoint, then gets out of the way.
+        global _real_authorization_endpoint
+        _real_authorization_endpoint = doc["authorization_endpoint"]
+        doc["authorization_endpoint"] = PROXY_PUBLIC + "/_authorize"
     return doc
+
+
+def patch_resource_param(body: bytes) -> bytes:
+    """Undo the client-facing `resource` rewrite on an outgoing form body
+    (the real /token request) so the IdP still binds the token to the real
+    server's audience instead of the proxy's."""
+    pairs = parse_qsl(body.decode("utf-8"), keep_blank_values=True)
+    changed = False
+    patched = []
+    for k, v in pairs:
+        # Compare origins with trailing slashes normalized away -- clients
+        # don't necessarily echo `resource` back byte-for-byte from what the
+        # metadata said (e.g. adding a trailing "/"), and an un-patched
+        # `resource` here means the real IdP rejects the token request.
+        if k == "resource" and v.rstrip("/") == PROXY_PUBLIC.rstrip("/"):
+            v = _real_resource
+            changed = True
+        patched.append((k, v))
+    return urlencode(patched).encode("utf-8") if changed else body
+
+
+def summarize_form(body: bytes) -> dict | None:
+    """Pull out form fields (token/DCR requests) for the log; secrets among
+    them get masked same as JSON-RPC bodies."""
+    try:
+        return dict(parse_qsl(body.decode("utf-8"), keep_blank_values=True))
+    except Exception:
+        return None
 
 
 def rewrite_www_authenticate(value: str) -> str:
@@ -177,7 +251,10 @@ def rewrite_origin(headers: dict, upstream_url: str) -> dict:
     origin = f"{parts.scheme}://{parts.netloc}"
     for key in list(headers.keys()):
         low = key.lower()
-        if low == "origin" and headers[key]:
+        if low == "origin" and headers[key] and headers[key] != "null":
+            # "null" is the literal value browsers send for opaque origins
+            # (sandboxed iframes, etc.) -- it's not a mismatch to fix, so
+            # leave it alone rather than replacing it with a real origin.
             headers[key] = origin
         elif low == "referer" and headers[key]:
             headers[key] = origin + "/"
@@ -200,6 +277,13 @@ async def relay(request: Request, upstream_url: str) -> Response:
     req_headers = clean_request_headers(request)
     req_headers = rewrite_origin(req_headers, upstream_url)
 
+    form_fields = None
+    ctype_in = request.headers.get("content-type", "")
+    if body and "application/x-www-form-urlencoded" in ctype_in:
+        if _real_resource:
+            body = patch_resource_param(body)
+        form_fields = summarize_form(body)
+
     # Log the outbound request.
     log({
         "dir": "request",
@@ -207,6 +291,7 @@ async def relay(request: Request, upstream_url: str) -> Response:
         "url": upstream_url,
         "headers": mask_headers(req_headers),
         "jsonrpc": mask(summarize_jsonrpc(body)) if body else None,
+        "form": mask(form_fields) if form_fields else None,
     })
 
     upstream_req = _client.build_request(
@@ -293,9 +378,38 @@ async def relay(request: Request, upstream_url: str) -> Response:
 # Routes
 # ---------------------------------------------------------------------------
 async def handle_root(request: Request) -> Response:
-    """Everything under / goes to the configured MCP upstream."""
+    """Everything under / goes to the configured MCP upstream.
+
+    Well-known discovery documents (RFC 8414 / RFC 9728) are conventionally
+    served at the bare origin root, not nested under UPSTREAM's own path, so
+    route those to the origin instead of appending them to UPSTREAM's path --
+    otherwise e.g. UPSTREAM=https://mcp.example.com/mcp would send
+    /.well-known/oauth-protected-resource to .../mcp/.well-known/... (404).
+    """
     tail = request.url.path  # includes leading slash
-    upstream_url = UPSTREAM + ("" if tail == "/" else tail)
+    if tail.startswith("/.well-known/"):
+        # RFC 8414 path-insertion: a client deriving the metadata URL for one
+        # of our rewritten (/_up/{host}/...) issuers inserts /.well-known/xxx
+        # *before* the issuer's apparent path -- which, for us, is our own
+        # /_up/{host} marker -- producing e.g.
+        # /.well-known/oauth-authorization-server/_up/{host}/{rest}. That
+        # must go to the real {host} with the well-known prefix re-inserted
+        # ahead of its real path, not be treated as a lookup against
+        # UPSTREAM's own origin.
+        up_marker = "/_up/"
+        idx = tail.find(up_marker)
+        if idx != -1:
+            wellknown_prefix = tail[:idx]
+            host, _, rest = tail[idx + len(up_marker):].partition("/")
+            if host not in _known_auth_hosts:
+                return Response("unknown upstream host", status_code=403)
+            real_path = wellknown_prefix + ("/" + rest if rest else "")
+            upstream_url = urlunsplit(("https", host, real_path, "", ""))
+        else:
+            origin = urlsplit(UPSTREAM)
+            upstream_url = urlunsplit((origin.scheme, origin.netloc, tail, "", ""))
+    else:
+        upstream_url = UPSTREAM + ("" if tail == "/" else tail)
     return await relay(request, upstream_url)
 
 
@@ -314,6 +428,28 @@ async def handle_up(request: Request) -> Response:
     return await relay(request, upstream_url)
 
 
+async def handle_authorize(request: Request) -> Response:
+    """Redirect-bounce for the browser /authorize leg (see rewrite_metadata).
+
+    We don't proxy the interactive login UI -- only patch `resource` back to
+    the real value and 302 straight to the real IdP, so the browser's actual
+    session with the IdP (cookies, assets, subsequent redirects) is direct,
+    exactly as before, just with a correct `resource` on the way in.
+    """
+    if not _real_authorization_endpoint:
+        return Response("no authorization endpoint known yet -- retry discovery", status_code=404)
+    pairs = parse_qsl(request.url.query, keep_blank_values=True)
+    patched = [
+        (k, _real_resource) if k == "resource" and _real_resource else (k, v)
+        for k, v in pairs
+    ]
+    parts = urlsplit(_real_authorization_endpoint)
+    target = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(patched), ""))
+    log({"dir": "request", "method": "GET", "url": target,
+         "note": "authorize redirect-bounce; browser continues directly from here"})
+    return Response(status_code=302, headers={"Location": target})
+
+
 from contextlib import asynccontextmanager
 
 
@@ -322,11 +458,14 @@ async def lifespan(app):
     global _client
     _client = httpx.AsyncClient(timeout=httpx.Timeout(None), follow_redirects=False)
     print(f"[mcp-proxy] upstream={UPSTREAM}  public={PROXY_PUBLIC}  log={LOG_PATH}")
+    print("[mcp-proxy] run with a single worker (the default) -- the /_up "
+          "allowlist is in-process state and is not shared across workers")
     yield
     await _client.aclose()
 
 
 routes = [
+    Route("/_authorize", handle_authorize, methods=["GET"]),
     Route("/_up/{host}/{rest:path}", handle_up,
           methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]),
     Route("/{path:path}", handle_root,
