@@ -1,4 +1,4 @@
-# MCP OAuth logging proxy (prototype)
+# MCP debug proxy 
 
 A reverse proxy that sits between an MCP client (Claude Desktop, Kiro, etc.)
 and a **third-party remote MCP server**. It transparently relays traffic,
