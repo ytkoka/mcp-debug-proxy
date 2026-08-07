@@ -195,24 +195,52 @@ itself or other subscribers. Both `/ui` and `/events` are bound to
 `127.0.0.1` exactly like the rest of the proxy -- see [Known
 limitations](#known-limitations).
 
+The detail pane shows the **real response body** (pretty-printed when it's
+JSON, e.g. a `tools/list` response's actual tool definitions) alongside
+**response headers** (`content-type`, `mcp-session-id`, etc.) — both are
+masked the same way request headers/bodies already are, so an OAuth token
+response's `access_token` shows as `***MASKED***` there too, never the raw
+value. Browser housekeeping requests for `/favicon.ico` are answered
+directly by the proxy (204, not relayed upstream) so they don't clutter the
+exchange list.
+
 ## Log format
 
-One JSON object per line, e.g. a `tools/call`:
+One JSON object per line: a request record, followed by its paired response
+record (same `exchange_id`), e.g. a `tools/list` call:
 
 ```json
-{"dir":"request","method":"POST","url":"https://mcp.example.com/mcp",
+{"dir":"request","kind":"request","exchange_id":7,"method":"POST",
+ "url":"https://mcp.example.com/mcp",
  "headers":{"authorization":"***MASKED***"},
- "jsonrpc":{"id":2,"method":"tools/call","tool":"search","arguments":{"q":"hi"}},
+ "jsonrpc":{"id":2,"method":"tools/list"},
  "ts":1720000000.0}
+{"dir":"response","kind":"response","exchange_id":7,"status":200,
+ "content_type":"application/json",
+ "headers":{"mcp-session-id":"abc123"},
+ "body":{"id":2,"method":null},
+ "body_text":"{\"jsonrpc\": \"2.0\", \"id\": 2, \"result\": {\"tools\": [...]}}",
+ "body_text_truncated":false,
+ "duration_ms":42.1, "ts":1720000000.1}
 ```
 
+`body` is a minimal JSON-RPC summary (id/method/tool name/error only — for a
+*response*, which doesn't echo back a `method`, this is often just
+`{"id": N, "method": null}`). `body_text` is the actual response body —
+JSON-parsed and masked when possible, capped at 20,000 bytes with a
+`body_text_truncated` flag, otherwise raw text — and is what the [live
+UI](#live-debug-ui)'s Response pane renders. Either way, the client's real
+response is never touched by these caps; only what's written to the log /
+sent to `/events` is.
+
 Secrets (`access_token`, `refresh_token`, `client_secret`, auth `code`,
-`code_verifier`, `Authorization` header) are masked in the log. Tool
-`arguments` are logged in full — scrub these too if they may carry secrets.
-The same unmasked `arguments` are what the live `/ui`/`/events` feed shows,
-so anyone who can open that port sees them too — see [Live debug
-UI](#live-debug-ui). Log files (`*.jsonl`) are gitignored by default so
-they don't end up in the repo by accident.
+`code_verifier`, `Authorization` header) are masked in the log — in both
+`headers` and anywhere they appear inside `jsonrpc`/`form`/`body`/`body_text`.
+Tool `arguments` are logged in full — scrub these too if they may carry
+secrets. The same unmasked `arguments` are what the live `/ui`/`/events`
+feed shows, so anyone who can open that port sees them too — see [Live
+debug UI](#live-debug-ui). Log files (`*.jsonl`) are gitignored by default
+so they don't end up in the repo by accident.
 
 ## Origin / Referer
 
