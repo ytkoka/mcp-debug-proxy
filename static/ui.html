@@ -213,12 +213,15 @@
     html += '<h2>Request</h2>';
     html += pre({ headers: req.headers, jsonrpc: req.jsonrpc, form: req.form });
 
+    html += '<h2>Response headers</h2>';
+    html += pre(res.headers);
+
     if (ex.kind === 'stream_end' || ex.chunks.length) {
-      html += '<h2>Response (SSE, live)</h2>';
+      html += '<h2>Response body (SSE, live)</h2>';
       html += pre(ex.chunks.join(''));
       if (res.truncated) html += '<div class="trunc-note">stream_end summary truncated on disk; live view above is not</div>';
     } else {
-      html += '<h2>Response</h2>';
+      html += '<h2>Response body</h2>';
       html += (res.body_text !== undefined && res.body_text !== null)
         ? preBodyText(res.body_text)
         : pre(res.error);
