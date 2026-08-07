@@ -344,15 +344,20 @@ async def relay(request: Request, upstream_url: str) -> Response:
     try:
         upstream = await _client.send(upstream_req, stream=True)
     except httpx.HTTPError as exc:
+        # Surface the original exception type (e.g. RemoteProtocolError from
+        # an HTTP/2-only upstream httpx can't speak to) before it's flattened
+        # into a generic 502 -- otherwise nothing in the log/live UI
+        # distinguishes "unreachable" from "wrong protocol" from any other
+        # httpx.HTTPError subclass.
         ended = time.time()
         log({
             "dir": "response",
-            "kind": "response",
+            "kind": "proxy_error",
             "exchange_id": exchange_id,
             "ended": ended,
             "duration_ms": round((ended - t0) * 1000, 1),
             "url": upstream_url,
-            "error": str(exc),
+            "error": f"{type(exc).__name__}: {exc}",
         })
         return Response(f"upstream error: {exc}", status_code=502)
 

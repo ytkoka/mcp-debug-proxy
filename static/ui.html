@@ -235,7 +235,7 @@
     if (rec.kind === 'request' || rec.kind === 'redirect') {
       ex.request = rec;
       ex.kind = rec.kind;
-    } else if (rec.kind === 'response') {
+    } else if (rec.kind === 'response' || rec.kind === 'proxy_error') {
       ex.response = rec;
     } else if (rec.kind === 'stream_end') {
       ex.response = rec;
