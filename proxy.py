@@ -30,6 +30,7 @@ import itertools
 import json
 import os
 import time
+import webbrowser
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
@@ -48,6 +49,13 @@ UPSTREAM = os.environ.get("UPSTREAM", "https://mcp.example.com/mcp").rstrip("/")
 PROXY_PUBLIC = os.environ.get("PROXY_PUBLIC", "http://localhost:8080").rstrip("/")
 LOG_PATH = os.environ.get("LOG_PATH", "mcp_proxy.jsonl")
 _UI_HTML_PATH = Path(__file__).resolve().parent / "static" / "ui.html"
+
+# Opt-in: pop the live UI open in a browser window on startup. Off by
+# default -- lifespan() runs for real (not mocked) in a lot of the test
+# suite (e.g. `async with proxy.lifespan(proxy.app):`), and unconditionally
+# launching a browser there would spawn dozens of windows on every test run
+# and break headless/CI environments outright.
+OPEN_UI = os.environ.get("OPEN_UI", "").strip().lower() in ("1", "true", "yes")
 
 # Cap on what a single response record (buffered JSON body or the
 # accumulated SSE stream_end summary) may contain in the JSONL log / live
@@ -642,6 +650,15 @@ async def lifespan(app):
     print(f"[mcp-proxy] upstream={UPSTREAM}  public={PROXY_PUBLIC}  log={LOG_PATH}")
     print("[mcp-proxy] run with a single worker (the default) -- the /_up "
           "allowlist is in-process state and is not shared across workers")
+    if OPEN_UI:
+        # Best-effort: a headless box with no browser/DISPLAY shouldn't take
+        # the server down over this. uvicorn has already bound the listening
+        # socket by the time the ASGI lifespan startup phase runs, so the
+        # UI is reachable as soon as the browser gets to it.
+        try:
+            webbrowser.open(f"{PROXY_PUBLIC}/ui", new=1)
+        except Exception as exc:
+            print(f"[mcp-proxy] OPEN_UI: could not launch a browser ({exc})")
     yield
     await _client.aclose()
 

@@ -47,6 +47,7 @@ config file to edit.
 | `HISTORY_SIZE` | `500`                     | How many past exchange-level records `/events` backfills to a UI that connects late (oldest first). `stream_chunk` records never count against this. |
 | `EVENTS_QUEUE_MAXSIZE` | `512`             | Per-subscriber queue size for the live `/events` feed. A slow/stalled UI tab drops its own oldest queued records rather than blocking the proxy. |
 | `EVENTS_STATS_INTERVAL` | `15`             | Seconds between `/events` heartbeat events (also carries the live drop counter) sent to an idle SSE connection. |
+| `OPEN_UI`      | *(unset, off)*                  | Set to `1`/`true`/`yes` to automatically open `/ui` in a browser window on startup. Off by default — see [Live debug UI](#live-debug-ui). |
 
 ## Running
 
@@ -183,7 +184,8 @@ by the real IdP to the browser directly, not relayed through us.
 ## Live debug UI
 
 Open `http://localhost:8080/ui` while the proxy is running to watch
-exchanges as they happen (Charles/Fiddler-style): a live list of
+exchanges as they happen (Charles/Fiddler-style), or set `OPEN_UI=1` to have
+the proxy open it for you in a browser window on startup: a live list of
 request/response pairs (method, path, status, duration, tool name, OAuth-leg
 badges), a detail pane on click, and SSE tool responses growing in place as
 chunks arrive rather than only appearing once the stream closes. It's fed by

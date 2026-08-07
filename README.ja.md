@@ -46,6 +46,7 @@ pip install -r requirements.txt
 | `HISTORY_SIZE` | `500`                     | 遅れて接続してきた UI に対して `/events` がバックフィルする、過去の exchange 単位レコードの件数（古い順）。`stream_chunk` レコードはこの件数にはカウントされません。 |
 | `EVENTS_QUEUE_MAXSIZE` | `512`             | ライブ `/events` フィードにおける購読者ごとのキューサイズ。UI タブが遅かったり詰まったりしても、プロキシ本体をブロックせず、そのタブ自身の一番古いキュー済みレコードが捨てられるだけです。 |
 | `EVENTS_STATS_INTERVAL` | `15`             | アイドル状態の `/events` 接続に送る、ハートビートイベント（ライブのドロップ件数カウンタも兼ねる）の送信間隔（秒）。 |
+| `OPEN_UI`      | *(未設定、無効)*                  | `1`/`true`/`yes` を設定すると、起動時に `/ui` を自動的にブラウザウィンドウで開きます。デフォルトでは無効です — [Live debug UI（ライブデバッグ UI）](#live-debug-ui) を参照。 |
 
 ## <a id="running"></a>Running（起動）
 
@@ -188,8 +189,9 @@ protected-resource メタデータの `resource` の値を、実際に接続し�
 ## <a id="live-debug-ui"></a>Live debug UI（ライブデバッグ UI）
 
 プロキシを起動した状態で `http://localhost:8080/ui` を開くと、Charles や
-Fiddler のように、やり取りがリアルタイムで発生する様子を確認できます:
-request/response のペアのライブ一覧（method・path・status・所要時間・
+Fiddler のように、やり取りがリアルタイムで発生する様子を確認できます。
+`OPEN_UI=1` を設定しておけば、起動時にプロキシが自動でブラウザウィンドウを
+開いてくれます: request/response のペアのライブ一覧（method・path・status・所要時間・
 tool 名・OAuth リグのバッジ）、クリックで開く詳細ペイン、そして SSE の
 tool レスポンスがストリームが閉じるのを待たずにその場でどんどん伸びていく
 表示です。これは `GET /events`（`text/event-stream`）によって配信されて
