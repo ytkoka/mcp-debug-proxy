@@ -1,6 +1,5 @@
-[日本語](README.ja.md)
-
 # MCP debug proxy 
+[日本語](README.ja.md)
 
 A reverse proxy that sits between an MCP client (Claude Desktop, Kiro, etc.)
 and a **third-party remote MCP server**. It transparently relays traffic,
@@ -8,8 +7,7 @@ writes a JSONL audit log of every JSON-RPC exchange, and rewrites OAuth
 discovery metadata so the registration + token legs also pass through the
 proxy (and get logged).
 
-This is a prototype seed meant to be extended in Claude Code — use it to
-watch exactly what an MCP client and a remote MCP server say to each other,
+Use it to watch exactly what an MCP client and a remote MCP server say to each other,
 including the OAuth dance, without needing a packet sniffer or a debugger
 inside the client.
 
