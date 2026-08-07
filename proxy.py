@@ -25,6 +25,7 @@ Then point the MCP client at:  http://localhost:8080/
 """
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 import os
@@ -50,6 +51,11 @@ LOG_PATH = os.environ.get("LOG_PATH", "mcp_proxy.jsonl")
 # publish() is non-blocking by construction (see broker.py) -- log() calling
 # it here never adds an `await` to relay()'s hot path.
 broker = Broker(queue_maxsize=int(os.environ.get("EVENTS_QUEUE_MAXSIZE", "512")))
+
+# How often (seconds) an idle /events connection gets a synthetic "stats"
+# event -- doubles as a keep-alive and as the carrier for the live-UI drop
+# counter (see handle_events()).
+EVENTS_STATS_INTERVAL = float(os.environ.get("EVENTS_STATS_INTERVAL", "15"))
 
 # Hop-by-hop headers must not be forwarded (RFC 7230 6.1).
 HOP_BY_HOP = {
@@ -507,6 +513,39 @@ async def handle_authorize(request: Request) -> Response:
     return Response(status_code=302, headers={"Location": target})
 
 
+async def handle_events(request: Request) -> StreamingResponse:
+    """Live SSE feed of proxy activity for a debug UI (e.g. /ui). Never
+    forwarded upstream -- registered ahead of the catch-all route below.
+
+    Subscribes to the broker, drains its queue, and forwards each record as
+    an SSE `data:` event. When idle, emits a periodic `kind: "stats"` event
+    instead of a bare `:` comment -- EventSource discards comment lines at
+    the browser's protocol layer, so a comment-only heartbeat would be
+    invisible to the UI's drop-counter display; a real data event serves as
+    both the keep-alive and the counter update.
+    """
+    queue, _history = broker.subscribe()
+
+    async def gen():
+        try:
+            while True:
+                try:
+                    rec = await asyncio.wait_for(queue.get(), timeout=EVENTS_STATS_INTERVAL)
+                except asyncio.TimeoutError:
+                    stats = {"kind": "stats", "dropped": broker.dropped_total, "ts": time.time()}
+                    yield f"data: {json.dumps(stats)}\n\n"
+                    continue
+                yield f"data: {json.dumps(rec, ensure_ascii=False)}\n\n"
+        finally:
+            broker.unsubscribe(queue)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 from contextlib import asynccontextmanager
 
 
@@ -525,6 +564,7 @@ routes = [
     Route("/_authorize", handle_authorize, methods=["GET"]),
     Route("/_up/{host}/{rest:path}", handle_up,
           methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]),
+    Route("/events", handle_events, methods=["GET"]),
     Route("/{path:path}", handle_root,
           methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]),
 ]
