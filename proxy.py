@@ -504,6 +504,14 @@ async def handle_root(request: Request) -> Response:
     /.well-known/oauth-protected-resource to .../mcp/.well-known/... (404).
     """
     tail = request.url.path  # includes leading slash
+    if tail.endswith("favicon.ico"):
+        # Browsers auto-request this against whatever origin/path a tab is
+        # open on (e.g. a browser sitting on /ui, or someone poking at
+        # UPSTREAM's own /mcp path directly) -- it's not MCP traffic, so
+        # answer it here instead of relaying it upstream and cluttering the
+        # exchange list with 404 noise. Not logged/published: it's not a
+        # proxy exchange, just browser housekeeping.
+        return Response(status_code=204)
     if tail.startswith("/.well-known/"):
         # RFC 8414 path-insertion: a client deriving the metadata URL for one
         # of our rewritten (/_up/{host}/...) issuers inserts /.well-known/xxx
