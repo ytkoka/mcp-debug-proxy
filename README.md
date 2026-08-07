@@ -256,6 +256,26 @@ values the client actually sent are replaced.
   routing table.
 - **Log rotation / redaction policy** is not implemented.
 
+## Troubleshooting: 502 through the proxy, but the upstream itself is fine
+
+If `curl`ing `UPSTREAM` directly works but every request through the proxy
+comes back `502 upstream error: ...`, check the `kind: "proxy_error"` record
+the failed request produced (`tail -f mcp_proxy.jsonl` or watch `/ui`) — it
+carries the original httpx exception's class name, which narrows down the
+cause:
+
+- **`RemoteProtocolError`** (or the connection just hangs/fails outright on
+  an upstream that answers `curl --http2` fine) — usually an **HTTP/2-only
+  upstream** (common behind CloudFront and similar edge proxies). The proxy
+  negotiates HTTP/2 via ALPN automatically (`http2=True` on the httpx
+  client, falling back to HTTP/1.1 when the upstream doesn't offer it) — if
+  you're still seeing this, confirm the `h2` package from
+  `requirements.txt` is actually installed (`pip show h2`).
+- **`ConnectError` / `ConnectTimeout`** — `UPSTREAM` is unreachable from
+  where the proxy runs (DNS, firewall, wrong host/port) — not a proxy bug.
+- **`ReadTimeout`** — the upstream accepted the connection but never
+  responded — check the upstream's own health, not the proxy.
+
 ## Testing
 
 ```bash
@@ -266,7 +286,10 @@ pytest
 
 Tests spin up a stub MCP/IdP server and drive the proxy against it (some via
 real localhost sockets, some via an in-process ASGI transport) — no network
-access or real MCP server is needed.
+access or real MCP server is needed. Tests marked `integration` (needing
+real external network access) are excluded by default via `pytest.ini`; none
+exist yet, but the marker is there for e.g. real HTTP/2-upstream checks that
+would otherwise make CI flaky.
 
 ## License
 
