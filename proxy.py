@@ -600,7 +600,12 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app):
     global _client
-    _client = httpx.AsyncClient(timeout=httpx.Timeout(None), follow_redirects=False)
+    # http2=True lets httpx negotiate HTTP/2 via ALPN with upstreams that
+    # are HTTP/2-only (common behind CloudFront and similar edge proxies);
+    # httpx falls back to HTTP/1.1 automatically for upstreams that don't
+    # offer h2, so this is backward-compatible with existing HTTP/1.1
+    # upstreams. Requires the `h2` package (see requirements.txt).
+    _client = httpx.AsyncClient(timeout=httpx.Timeout(None), follow_redirects=False, http2=True)
     print(f"[mcp-proxy] upstream={UPSTREAM}  public={PROXY_PUBLIC}  log={LOG_PATH}")
     print("[mcp-proxy] run with a single worker (the default) -- the /_up "
           "allowlist is in-process state and is not shared across workers")
