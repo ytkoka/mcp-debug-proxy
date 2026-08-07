@@ -134,14 +134,17 @@ async def test_full_oauth_flow_and_regressions(monkeypatch, tmp_path):
     await asyncio.sleep(0.2)  # let the SSE handler's finally-block log write land
 
     stream_lens = []
+    stream_kinds = []
     error_found = False
     with open(proxy.LOG_PATH) as fh:
         for line in fh:
             rec = json.loads(line)
             if rec.get("stream"):
                 stream_lens.append(len(rec.get("raw", "")))
+                stream_kinds.append(rec.get("kind"))
             if "error" in rec:
                 error_found = True
 
     assert stream_lens and all(n <= 20000 for n in stream_lens)
+    assert stream_kinds == ["stream_end"] * len(stream_kinds)
     assert error_found

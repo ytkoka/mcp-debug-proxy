@@ -37,12 +37,19 @@ from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
+from broker import Broker
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 UPSTREAM = os.environ.get("UPSTREAM", "https://mcp.example.com/mcp").rstrip("/")
 PROXY_PUBLIC = os.environ.get("PROXY_PUBLIC", "http://localhost:8080").rstrip("/")
 LOG_PATH = os.environ.get("LOG_PATH", "mcp_proxy.jsonl")
+
+# Live subscriber fan-out (e.g. the /events SSE endpoint) for a debug UI.
+# publish() is non-blocking by construction (see broker.py) -- log() calling
+# it here never adds an `await` to relay()'s hot path.
+broker = Broker(queue_maxsize=int(os.environ.get("EVENTS_QUEUE_MAXSIZE", "512")))
 
 # Hop-by-hop headers must not be forwarded (RFC 7230 6.1).
 HOP_BY_HOP = {
@@ -106,6 +113,7 @@ def log(record: dict) -> None:
     record["ts"] = time.time()
     with open(LOG_PATH, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    broker.publish(record)
 
 
 def mask(obj):
@@ -296,6 +304,7 @@ async def relay(request: Request, upstream_url: str) -> Response:
     # Log the outbound request.
     log({
         "dir": "request",
+        "kind": "request",
         "exchange_id": exchange_id,
         "started": t0,
         "method": request.method,
@@ -317,6 +326,7 @@ async def relay(request: Request, upstream_url: str) -> Response:
         ended = time.time()
         log({
             "dir": "response",
+            "kind": "response",
             "exchange_id": exchange_id,
             "ended": ended,
             "duration_ms": round((ended - t0) * 1000, 1),
@@ -331,27 +341,49 @@ async def relay(request: Request, upstream_url: str) -> Response:
     # --- streaming (SSE) path: never buffer, tee chunks to the log ----------
     if "text/event-stream" in ctype:
         MAX_STREAM_LOG_BYTES = 20000
+        # Cap applied to each individually-published stream_chunk record
+        # (never to what's actually relayed to the client). Separate from
+        # MAX_STREAM_LOG_BYTES, which caps the cumulative buffer written to
+        # the JSONL file as the stream_end summary.
+        MAX_CHUNK_PUBLISH_BYTES = 8000
 
         async def body_iter():
             # Cap what we hold for the log entry -- the stream itself may run
             # for the life of an MCP session, so buf must not grow unbounded.
             buf = bytearray()
+            seq = 0
             try:
                 async for chunk in upstream.aiter_raw():
                     if len(buf) < MAX_STREAM_LOG_BYTES:
                         buf.extend(chunk[: MAX_STREAM_LOG_BYTES - len(buf)])
+                    # Live fan-out only -- never written to the JSONL file,
+                    # so a long-lived stream can't grow the log file
+                    # unbounded or evict other exchanges from history (T5).
+                    seq += 1
+                    broker.publish({
+                        "kind": "stream_chunk",
+                        "dir": "response",
+                        "exchange_id": exchange_id,
+                        "url": upstream_url,
+                        "seq": seq,
+                        "data": chunk[:MAX_CHUNK_PUBLISH_BYTES].decode("utf-8", "replace"),
+                        "truncated": len(chunk) > MAX_CHUNK_PUBLISH_BYTES,
+                        "ts": time.time(),
+                    }, history=False)
                     yield chunk
             finally:
                 await upstream.aclose()
                 ended = time.time()
                 log({
                     "dir": "response",
+                    "kind": "stream_end",
                     "exchange_id": exchange_id,
                     "ended": ended,
                     "duration_ms": round((ended - t0) * 1000, 1),
                     "url": upstream_url,
                     "status": upstream.status_code,
                     "stream": True,
+                    "truncated": len(buf) >= MAX_STREAM_LOG_BYTES,
                     "raw": buf.decode("utf-8", "replace"),
                 })
         return StreamingResponse(
@@ -383,6 +415,7 @@ async def relay(request: Request, upstream_url: str) -> Response:
     ended = time.time()
     log({
         "dir": "response",
+        "kind": "response",
         "exchange_id": exchange_id,
         "ended": ended,
         "duration_ms": round((ended - t0) * 1000, 1),
@@ -468,7 +501,8 @@ async def handle_authorize(request: Request) -> Response:
     ]
     parts = urlsplit(_real_authorization_endpoint)
     target = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(patched), ""))
-    log({"dir": "request", "exchange_id": next(_exchange_ids), "method": "GET", "url": target,
+    log({"dir": "request", "kind": "redirect", "exchange_id": next(_exchange_ids),
+         "method": "GET", "url": target,
          "note": "authorize redirect-bounce; browser continues directly from here"})
     return Response(status_code=302, headers={"Location": target})
 
