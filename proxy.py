@@ -49,8 +49,14 @@ LOG_PATH = os.environ.get("LOG_PATH", "mcp_proxy.jsonl")
 
 # Live subscriber fan-out (e.g. the /events SSE endpoint) for a debug UI.
 # publish() is non-blocking by construction (see broker.py) -- log() calling
-# it here never adds an `await` to relay()'s hot path.
-broker = Broker(queue_maxsize=int(os.environ.get("EVENTS_QUEUE_MAXSIZE", "512")))
+# it here never adds an `await` to relay()'s hot path. HISTORY_SIZE bounds
+# how many past exchange-level records (never stream_chunk noise -- see
+# broker.py) a UI that connects late gets backfilled with.
+HISTORY_SIZE = int(os.environ.get("HISTORY_SIZE", "500"))
+broker = Broker(
+    queue_maxsize=int(os.environ.get("EVENTS_QUEUE_MAXSIZE", "512")),
+    history_size=HISTORY_SIZE,
+)
 
 # How often (seconds) an idle /events connection gets a synthetic "stats"
 # event -- doubles as a keep-alive and as the carrier for the live-UI drop
@@ -517,17 +523,22 @@ async def handle_events(request: Request) -> StreamingResponse:
     """Live SSE feed of proxy activity for a debug UI (e.g. /ui). Never
     forwarded upstream -- registered ahead of the catch-all route below.
 
-    Subscribes to the broker, drains its queue, and forwards each record as
-    an SSE `data:` event. When idle, emits a periodic `kind: "stats"` event
-    instead of a bare `:` comment -- EventSource discards comment lines at
-    the browser's protocol layer, so a comment-only heartbeat would be
-    invisible to the UI's drop-counter display; a real data event serves as
-    both the keep-alive and the counter update.
+    On connect, first backfills up to HISTORY_SIZE past exchange-level
+    records (oldest first) so a UI opened late isn't starting blind, then
+    subscribes to the broker, drains its queue, and forwards each new
+    record as an SSE `data:` event. When idle, emits a periodic
+    `kind: "stats"` event instead of a bare `:` comment -- EventSource
+    discards comment lines at the browser's protocol layer, so a
+    comment-only heartbeat would be invisible to the UI's drop-counter
+    display; a real data event serves as both the keep-alive and the
+    counter update.
     """
-    queue, _history = broker.subscribe()
+    queue, history = broker.subscribe()
 
     async def gen():
         try:
+            for rec in history:
+                yield f"data: {json.dumps(rec, ensure_ascii=False)}\n\n"
             while True:
                 try:
                     rec = await asyncio.wait_for(queue.get(), timeout=EVENTS_STATS_INTERVAL)
