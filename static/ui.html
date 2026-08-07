@@ -178,6 +178,16 @@
     return '<pre>' + escapeHtml(text) + '</pre>';
   }
 
+  // Server sends the real response body as a single string (already masked
+  // and capped -- see body_text in proxy.py): JSON if it parses cleanly,
+  // pretty-printed for readability; otherwise shown as-is.
+  function preBodyText(text) {
+    if (text === null || text === undefined) return '<pre>(none)</pre>';
+    let display = text;
+    try { display = JSON.stringify(JSON.parse(text), null, 2); } catch { /* not JSON, show raw */ }
+    return '<pre>' + escapeHtml(display) + '</pre>';
+  }
+
   function selectRow(id) {
     const prev = rowEls.get(selectedId);
     if (prev) prev.classList.remove('selected');
@@ -209,8 +219,10 @@
       if (res.truncated) html += '<div class="trunc-note">stream_end summary truncated on disk; live view above is not</div>';
     } else {
       html += '<h2>Response</h2>';
-      html += pre(res.body !== undefined ? res.body : res.error);
-      if (res.truncated) html += '<div class="trunc-note">body truncated in log/UI (client received it in full)</div>';
+      html += (res.body_text !== undefined && res.body_text !== null)
+        ? preBodyText(res.body_text)
+        : pre(res.error);
+      if (res.body_text_truncated) html += '<div class="trunc-note">body truncated in log/UI (client received it in full)</div>';
     }
 
     detail.innerHTML = html;

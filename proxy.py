@@ -421,6 +421,7 @@ async def relay(request: Request, upstream_url: str) -> Response:
     raw = await upstream.aread()
     await upstream.aclose()
 
+    doc = None
     logged_body = None
     if "application/json" in ctype and raw:
         try:
@@ -447,6 +448,26 @@ async def relay(request: Request, upstream_url: str) -> Response:
             truncated = True
             body_for_log = serialized[:MAX_STREAM_LOG_BYTES].decode("utf-8", "replace")
 
+    # The *actual* response body, for the live UI/log -- independent of
+    # `body_for_log` above, which is only ever a JSON-RPC summary
+    # (id/method/tool/error) and drops the real payload entirely (e.g. a
+    # tools/list response's tool definitions never appeared in `body`).
+    # Masked (mask() applied to the parsed JSON) and capped the same way;
+    # `raw`, returned to the client above, is never touched by this.
+    if doc is not None:
+        body_text_full = json.dumps(mask(doc), ensure_ascii=False)
+    elif raw:
+        body_text_full = raw.decode("utf-8", "replace")
+    else:
+        body_text_full = None
+    body_text = body_text_full
+    body_text_truncated = False
+    if body_text_full is not None:
+        encoded = body_text_full.encode("utf-8")
+        if len(encoded) > MAX_STREAM_LOG_BYTES:
+            body_text = encoded[:MAX_STREAM_LOG_BYTES].decode("utf-8", "replace")
+            body_text_truncated = True
+
     ended = time.time()
     log({
         "dir": "response",
@@ -459,6 +480,8 @@ async def relay(request: Request, upstream_url: str) -> Response:
         "content_type": ctype,
         "body": body_for_log,
         "truncated": truncated,
+        "body_text": body_text,
+        "body_text_truncated": body_text_truncated,
     })
 
     # drop content-length from rewritten headers; Starlette recomputes it
