@@ -1,3 +1,5 @@
+[日本語](README.ja.md)
+
 # MCP debug proxy 
 
 A reverse proxy that sits between an MCP client (Claude Desktop, Kiro, etc.)
