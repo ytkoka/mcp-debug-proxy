@@ -49,6 +49,13 @@ PROXY_PUBLIC = os.environ.get("PROXY_PUBLIC", "http://localhost:8080").rstrip("/
 LOG_PATH = os.environ.get("LOG_PATH", "mcp_proxy.jsonl")
 _UI_HTML_PATH = Path(__file__).resolve().parent / "static" / "ui.html"
 
+# Cap on what a single response record (buffered JSON body or the
+# accumulated SSE stream_end summary) may contain in the JSONL log / live
+# feed. The client still gets the full, untruncated body -- only what
+# feeds log()/broker.publish() is capped, so a huge response can't grow the
+# log file or a subscriber's queue unbounded.
+MAX_STREAM_LOG_BYTES = 20000
+
 # Live subscriber fan-out (e.g. the /events SSE endpoint) for a debug UI.
 # publish() is non-blocking by construction (see broker.py) -- log() calling
 # it here never adds an `await` to relay()'s hot path. HISTORY_SIZE bounds
@@ -354,7 +361,6 @@ async def relay(request: Request, upstream_url: str) -> Response:
 
     # --- streaming (SSE) path: never buffer, tee chunks to the log ----------
     if "text/event-stream" in ctype:
-        MAX_STREAM_LOG_BYTES = 20000
         # Cap applied to each individually-published stream_chunk record
         # (never to what's actually relayed to the client). Separate from
         # MAX_STREAM_LOG_BYTES, which caps the cumulative buffer written to
@@ -426,6 +432,16 @@ async def relay(request: Request, upstream_url: str) -> Response:
         else:
             logged_body = mask(summarize_jsonrpc(raw)) or doc
 
+    # Cap what feeds the log/live-UI, never what's returned to the client
+    # (`raw`, sent below via Response(content=raw, ...), is untouched here).
+    body_for_log = mask(logged_body) if logged_body is not None else None
+    truncated = False
+    if body_for_log is not None:
+        serialized = json.dumps(body_for_log, ensure_ascii=False).encode("utf-8")
+        if len(serialized) > MAX_STREAM_LOG_BYTES:
+            truncated = True
+            body_for_log = serialized[:MAX_STREAM_LOG_BYTES].decode("utf-8", "replace")
+
     ended = time.time()
     log({
         "dir": "response",
@@ -436,7 +452,8 @@ async def relay(request: Request, upstream_url: str) -> Response:
         "url": upstream_url,
         "status": upstream.status_code,
         "content_type": ctype,
-        "body": mask(logged_body) if logged_body is not None else None,
+        "body": body_for_log,
+        "truncated": truncated,
     })
 
     # drop content-length from rewritten headers; Starlette recomputes it
