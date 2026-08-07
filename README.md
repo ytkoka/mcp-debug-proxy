@@ -44,6 +44,9 @@ config file to edit.
 | `PROXY_PUBLIC` | `http://localhost:8080`        | The base URL clients use to reach this proxy. Only change this if you're not running on `localhost:8080` (e.g. behind an SSH tunnel on a different port). |
 | `LOG_PATH`     | `mcp_proxy.jsonl`               | Where the JSONL audit log is written.                            |
 | `ALLOWED_AUTH_HOSTS` | *(unset)*                | Comma-separated IdP hosts to allow through `/_up/{host}` in addition to the ones OAuth discovery hands out at runtime. Useful so a client that skips discovery after a proxy restart (e.g. reusing a cached refresh token) doesn't get a spurious 403. `UPSTREAM`'s own host is always allowed. |
+| `HISTORY_SIZE` | `500`                     | How many past exchange-level records `/events` backfills to a UI that connects late (oldest first). `stream_chunk` records never count against this. |
+| `EVENTS_QUEUE_MAXSIZE` | `512`             | Per-subscriber queue size for the live `/events` feed. A slow/stalled UI tab drops its own oldest queued records rather than blocking the proxy. |
+| `EVENTS_STATS_INTERVAL` | `15`             | Seconds between `/events` heartbeat events (also carries the live drop counter) sent to an idle SSE connection. |
 
 ## Running
 
@@ -177,6 +180,21 @@ redirect-bounce (`handle_authorize()`) that patches `resource` and sends the
 browser straight on to the real IdP. The actual login UI is still rendered
 by the real IdP to the browser directly, not relayed through us.
 
+## Live debug UI
+
+Open `http://localhost:8080/ui` while the proxy is running to watch
+exchanges as they happen (Charles/Fiddler-style): a live list of
+request/response pairs (method, path, status, duration, tool name, OAuth-leg
+badges), a detail pane on click, and SSE tool responses growing in place as
+chunks arrive rather than only appearing once the stream closes. It's fed by
+`GET /events` (`text/event-stream`), which backfills recent history on
+connect (see `HISTORY_SIZE` above) and then streams live. Delivery to
+`/events` is best-effort: a slow or disconnected UI tab can only drop its
+own queued records (see `EVENTS_QUEUE_MAXSIZE`), never affect the proxy
+itself or other subscribers. Both `/ui` and `/events` are bound to
+`127.0.0.1` exactly like the rest of the proxy -- see [Known
+limitations](#known-limitations).
+
 ## Log format
 
 One JSON object per line, e.g. a `tools/call`:
@@ -191,8 +209,10 @@ One JSON object per line, e.g. a `tools/call`:
 Secrets (`access_token`, `refresh_token`, `client_secret`, auth `code`,
 `code_verifier`, `Authorization` header) are masked in the log. Tool
 `arguments` are logged in full — scrub these too if they may carry secrets.
-Log files (`*.jsonl`) are gitignored by default so they don't end up in the
-repo by accident.
+The same unmasked `arguments` are what the live `/ui`/`/events` feed shows,
+so anyone who can open that port sees them too — see [Live debug
+UI](#live-debug-ui). Log files (`*.jsonl`) are gitignored by default so
+they don't end up in the repo by accident.
 
 ## Origin / Referer
 
@@ -221,6 +241,10 @@ values the client actually sent are replaced.
 - **No authentication on the proxy port** — anything that can reach it can
   relay traffic through it. Keep `--host 127.0.0.1` (the uvicorn default) and
   use SSH port forwarding rather than exposing it, if you need remote access.
+  This includes `/ui` and `/events`: opening the port means anyone who can
+  reach it can watch the full, unmasked traffic of every MCP session going
+  through the proxy in real time (tool `arguments` in particular — see [Log
+  format](#log-format)), not just replay the log file after the fact.
 - **`/_up/{host}` is allowlisted, not open** — it only relays to hosts the
   proxy itself already handed out via `to_proxy_url()` (i.e. hosts seen in
   protected-resource/AS metadata or a `WWW-Authenticate` challenge), plus
