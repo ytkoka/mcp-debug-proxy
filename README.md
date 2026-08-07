@@ -204,6 +204,8 @@ value. Browser housekeeping requests for `/favicon.ico` are answered
 directly by the proxy (204, not relayed upstream) so they don't clutter the
 exchange list.
 
+![Live debug UI showing OAuth discovery and tools/call exchanges against a real MCP server, with a selected exchange's request/response headers and body in the detail pane](docs/live-ui.png)
+
 ## Log format
 
 One JSON object per line: a request record, followed by its paired response
