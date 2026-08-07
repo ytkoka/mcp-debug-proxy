@@ -30,6 +30,7 @@ import itertools
 import json
 import os
 import time
+from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import httpx
@@ -46,6 +47,7 @@ from broker import Broker
 UPSTREAM = os.environ.get("UPSTREAM", "https://mcp.example.com/mcp").rstrip("/")
 PROXY_PUBLIC = os.environ.get("PROXY_PUBLIC", "http://localhost:8080").rstrip("/")
 LOG_PATH = os.environ.get("LOG_PATH", "mcp_proxy.jsonl")
+_UI_HTML_PATH = Path(__file__).resolve().parent / "static" / "ui.html"
 
 # Live subscriber fan-out (e.g. the /events SSE endpoint) for a debug UI.
 # publish() is non-blocking by construction (see broker.py) -- log() calling
@@ -557,6 +559,19 @@ async def handle_events(request: Request) -> StreamingResponse:
     )
 
 
+async def handle_ui(request: Request) -> Response:
+    """Minimal Charles/Fiddler-style debug UI, backed by /events. Re-reads
+    static/ui.html from disk on every request rather than caching it at
+    import -- this isn't a hot path (opened a handful of times per debug
+    session), and it means editing the HTML and refreshing the browser tab
+    works without restarting uvicorn."""
+    try:
+        html = _UI_HTML_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return Response("static/ui.html missing", status_code=500)
+    return Response(html, media_type="text/html")
+
+
 from contextlib import asynccontextmanager
 
 
@@ -576,6 +591,7 @@ routes = [
     Route("/_up/{host}/{rest:path}", handle_up,
           methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]),
     Route("/events", handle_events, methods=["GET"]),
+    Route("/ui", handle_ui, methods=["GET"]),
     Route("/{path:path}", handle_root,
           methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]),
 ]

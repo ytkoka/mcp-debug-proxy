@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>mcp-debug-proxy</title>
+<style>
+  :root {
+    --bg: #1e1f22; --panel: #26282c; --border: #3a3d42; --text: #d8dadd;
+    --dim: #8b8f96; --accent: #5aa9ff; --ok: #58c38a; --err: #e5686b;
+    --warn: #e0b355; --badge: #3a3d42;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 8px 12px;
+    background: var(--panel); border-bottom: 1px solid var(--border); flex: 0 0 auto;
+  }
+  header h1 { font-size: 13px; font-weight: 600; margin: 0; color: var(--dim); }
+  header input[type=text] {
+    flex: 0 0 260px; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    padding: 5px 8px; border-radius: 4px; font-size: 12px;
+  }
+  header button {
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    padding: 5px 10px; border-radius: 4px; font-size: 12px; cursor: pointer;
+  }
+  header button.active { background: var(--accent); border-color: var(--accent); color: #10151c; }
+  #dropped { color: var(--warn); font-size: 12px; margin-left: auto; }
+  #dropped.zero { color: var(--dim); }
+  main { flex: 1 1 auto; display: flex; min-height: 0; }
+  #rows { flex: 0 0 46%; overflow-y: auto; border-right: 1px solid var(--border); }
+  #detail { flex: 1 1 auto; overflow-y: auto; padding: 12px 16px; }
+  table { width: 100%; border-collapse: collapse; }
+  thead th {
+    position: sticky; top: 0; background: var(--panel); text-align: left; padding: 6px 8px;
+    font-size: 11px; color: var(--dim); border-bottom: 1px solid var(--border); font-weight: 600;
+  }
+  tbody tr { cursor: pointer; border-bottom: 1px solid var(--border); }
+  tbody tr:hover { background: #2b2e33; }
+  tbody tr.selected { background: #2e3c52; }
+  tbody td { padding: 5px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 1px; }
+  td.status-2 { color: var(--ok); } td.status-4, td.status-5 { color: var(--err); }
+  td.pending { color: var(--dim); font-style: italic; }
+  .badge {
+    display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 3px;
+    background: var(--badge); color: var(--dim); margin-right: 4px;
+  }
+  .badge.oauth { color: var(--warn); } .badge.tool { color: var(--accent); }
+  h2 { font-size: 13px; margin: 0 0 8px; color: var(--dim); }
+  .kv { display: grid; grid-template-columns: 140px 1fr; gap: 2px 8px; margin-bottom: 14px; }
+  .kv div:nth-child(odd) { color: var(--dim); }
+  pre {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 4px;
+    padding: 8px 10px; white-space: pre-wrap; word-break: break-all; font-size: 12px;
+    max-height: 320px; overflow-y: auto;
+  }
+  .empty { color: var(--dim); padding: 24px; text-align: center; }
+  .trunc-note { color: var(--warn); font-size: 11px; margin-top: 2px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>mcp-debug-proxy</h1>
+  <input id="filter" type="text" placeholder="filter: method, path, tool&hellip;">
+  <button id="pause">Pause</button>
+  <span id="dropped" class="zero">0 dropped</span>
+</header>
+<main>
+  <div id="rows">
+    <table>
+      <thead>
+        <tr><th>#</th><th>kind</th><th>method</th><th>path / tool</th><th>status</th><th>ms</th></tr>
+      </thead>
+      <tbody id="rows-body"></tbody>
+    </table>
+  </div>
+  <div id="detail"><div class="empty">Select a row to see details.</div></div>
+</main>
+<script>
+(() => {
+  const exchanges = new Map();     // exchange_id -> row state
+  const rowEls = new Map();        // exchange_id -> <tr>
+  const rowsBody = document.getElementById('rows-body');
+  const detail = document.getElementById('detail');
+  const filterInput = document.getElementById('filter');
+  const pauseBtn = document.getElementById('pause');
+  const droppedEl = document.getElementById('dropped');
+
+  let selectedId = null;
+  let paused = false;
+  let pending = [];
+  let filterText = '';
+
+  function pathOf(url) {
+    try { const u = new URL(url); return u.pathname + u.search; }
+    catch { return url || ''; }
+  }
+
+  function oauthBadge(req) {
+    if (!req) return false;
+    const url = req.url || '';
+    if (/\/_up\/|\/\.well-known\/|\/_authorize|\/token|\/register|\/authorize/.test(url)) return true;
+    if (req.form) return true;
+    return false;
+  }
+
+  function toolName(req) {
+    return req && req.jsonrpc && req.jsonrpc.tool;
+  }
+
+  function matchesFilter(ex) {
+    if (!filterText) return true;
+    const hay = [
+      ex.request && ex.request.method,
+      ex.request && pathOf(ex.request.url),
+      toolName(ex.request),
+    ].filter(Boolean).join(' ').toLowerCase();
+    return hay.includes(filterText);
+  }
+
+  function statusClass(status) {
+    if (!status) return '';
+    return 'status-' + String(status)[0];
+  }
+
+  function renderRow(ex) {
+    let tr = rowEls.get(ex.id);
+    if (!tr) {
+      tr = document.createElement('tr');
+      tr.addEventListener('click', () => selectRow(ex.id));
+      rowEls.set(ex.id, tr);
+      rowsBody.appendChild(tr);
+    }
+    tr.style.display = matchesFilter(ex) ? '' : 'none';
+    tr.className = (ex.id === selectedId ? 'selected ' : '');
+
+    const req = ex.request;
+    const res = ex.response;
+    const method = req ? req.method : '';
+    const badges = [];
+    if (oauthBadge(req)) badges.push('<span class="badge oauth">oauth</span>');
+    const tool = toolName(req);
+    if (tool) badges.push('<span class="badge tool">' + escapeHtml(tool) + '</span>');
+    const pathLabel = badges.join('') + escapeHtml(req ? pathOf(req.url) : (ex.kind === 'stats' ? '' : ''));
+
+    let statusCell = '<span class="pending">&hellip;</span>';
+    let statusCls = '';
+    let ms = '';
+    if (ex.kind === 'redirect') {
+      statusCell = '302';
+    } else if (res) {
+      statusCell = res.status != null ? String(res.status) : (res.error ? 'ERR' : '');
+      statusCls = statusClass(res.status);
+      ms = res.duration_ms != null ? String(Math.round(res.duration_ms)) : '';
+    }
+
+    tr.innerHTML =
+      '<td>' + ex.id + '</td>' +
+      '<td>' + escapeHtml(ex.kind) + '</td>' +
+      '<td>' + escapeHtml(method) + '</td>' +
+      '<td>' + pathLabel + '</td>' +
+      '<td class="' + statusCls + '">' + statusCell + '</td>' +
+      '<td>' + ms + '</td>';
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+  }
+
+  function pre(obj) {
+    if (obj === null || obj === undefined) return '<pre>(none)</pre>';
+    const text = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
+    return '<pre>' + escapeHtml(text) + '</pre>';
+  }
+
+  function selectRow(id) {
+    const prev = rowEls.get(selectedId);
+    if (prev) prev.classList.remove('selected');
+    selectedId = id;
+    const tr = rowEls.get(id);
+    if (tr) tr.classList.add('selected');
+    renderDetail();
+  }
+
+  function renderDetail() {
+    const ex = exchanges.get(selectedId);
+    if (!ex) { detail.innerHTML = '<div class="empty">Select a row to see details.</div>'; return; }
+    const req = ex.request || {};
+    const res = ex.response || {};
+
+    let html = '<h2>Exchange #' + ex.id + '</h2>';
+    html += '<div class="kv">' +
+      '<div>Method / URL</div><div>' + escapeHtml((req.method || '') + ' ' + (req.url || '')) + '</div>' +
+      '<div>Status</div><div>' + escapeHtml(res.status != null ? res.status : (res.error || (ex.kind === 'redirect' ? '302 (redirect)' : 'pending'))) + '</div>' +
+      '<div>Duration</div><div>' + (res.duration_ms != null ? Math.round(res.duration_ms) + ' ms' : '') + '</div>' +
+      '</div>';
+
+    html += '<h2>Request</h2>';
+    html += pre({ headers: req.headers, jsonrpc: req.jsonrpc, form: req.form });
+
+    if (ex.kind === 'stream_end' || ex.chunks.length) {
+      html += '<h2>Response (SSE, live)</h2>';
+      html += pre(ex.chunks.join(''));
+      if (res.truncated) html += '<div class="trunc-note">stream_end summary truncated on disk; live view above is not</div>';
+    } else {
+      html += '<h2>Response</h2>';
+      html += pre(res.body !== undefined ? res.body : res.error);
+      if (res.truncated) html += '<div class="trunc-note">body truncated in log/UI (client received it in full)</div>';
+    }
+
+    detail.innerHTML = html;
+  }
+
+  function applyRecord(rec) {
+    if (rec.kind === 'stats') {
+      droppedEl.textContent = rec.dropped + ' dropped';
+      droppedEl.className = rec.dropped > 0 ? '' : 'zero';
+      return;
+    }
+
+    const id = rec.exchange_id;
+    if (id === undefined || id === null) return;
+
+    let ex = exchanges.get(id);
+    if (!ex) {
+      ex = { id, kind: rec.kind, request: null, response: null, chunks: [] };
+      exchanges.set(id, ex);
+    }
+
+    if (rec.kind === 'request' || rec.kind === 'redirect') {
+      ex.request = rec;
+      ex.kind = rec.kind;
+    } else if (rec.kind === 'response') {
+      ex.response = rec;
+    } else if (rec.kind === 'stream_end') {
+      ex.response = rec;
+      ex.kind = 'stream_end';
+    } else if (rec.kind === 'stream_chunk') {
+      ex.chunks.push(rec.data);
+      if (id === selectedId) renderDetail();
+    }
+
+    renderRow(ex);
+    if (id === selectedId && rec.kind !== 'stream_chunk') renderDetail();
+  }
+
+  function handleIncoming(rec) {
+    if (paused) { pending.push(rec); return; }
+    applyRecord(rec);
+  }
+
+  pauseBtn.addEventListener('click', () => {
+    paused = !paused;
+    pauseBtn.textContent = paused ? 'Resume' : 'Pause';
+    pauseBtn.classList.toggle('active', paused);
+    if (!paused) {
+      const buffered = pending;
+      pending = [];
+      buffered.forEach(applyRecord);
+    }
+  });
+
+  filterInput.addEventListener('input', () => {
+    filterText = filterInput.value.trim().toLowerCase();
+    exchanges.forEach(renderRow);
+  });
+
+  const es = new EventSource('/events');
+  es.onmessage = (e) => {
+    let rec;
+    try { rec = JSON.parse(e.data); } catch { return; }
+    handleIncoming(rec);
+  };
+})();
+</script>
+</body>
+</html>
