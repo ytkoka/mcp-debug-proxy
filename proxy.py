@@ -25,6 +25,7 @@ Then point the MCP client at:  http://localhost:8080/
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import time
@@ -58,6 +59,12 @@ SECRET_KEYS = {
 }
 
 _client: httpx.AsyncClient  # set in lifespan
+
+# Monotonic id pairing a relay() call's request/response (and, later, its
+# SSE stream_chunk) log records together. Safe without a lock: incremented
+# synchronously (no `await` in between), and everything runs on one asyncio
+# event loop, so there's no interleaving that could race two callers.
+_exchange_ids = itertools.count(1)
 
 # Hosts we've pointed the client at via to_proxy_url() (auth-server /_up
 # legs). /_up/{host}/... must only proxy to hosts we ourselves handed out --
@@ -273,6 +280,8 @@ def clean_response_headers(resp: httpx.Response) -> list[tuple[str, str]]:
 
 
 async def relay(request: Request, upstream_url: str) -> Response:
+    exchange_id = next(_exchange_ids)
+    t0 = time.time()
     body = await request.body()
     req_headers = clean_request_headers(request)
     req_headers = rewrite_origin(req_headers, upstream_url)
@@ -287,6 +296,8 @@ async def relay(request: Request, upstream_url: str) -> Response:
     # Log the outbound request.
     log({
         "dir": "request",
+        "exchange_id": exchange_id,
+        "started": t0,
         "method": request.method,
         "url": upstream_url,
         "headers": mask_headers(req_headers),
@@ -303,8 +314,12 @@ async def relay(request: Request, upstream_url: str) -> Response:
     try:
         upstream = await _client.send(upstream_req, stream=True)
     except httpx.HTTPError as exc:
+        ended = time.time()
         log({
             "dir": "response",
+            "exchange_id": exchange_id,
+            "ended": ended,
+            "duration_ms": round((ended - t0) * 1000, 1),
             "url": upstream_url,
             "error": str(exc),
         })
@@ -328,8 +343,12 @@ async def relay(request: Request, upstream_url: str) -> Response:
                     yield chunk
             finally:
                 await upstream.aclose()
+                ended = time.time()
                 log({
                     "dir": "response",
+                    "exchange_id": exchange_id,
+                    "ended": ended,
+                    "duration_ms": round((ended - t0) * 1000, 1),
                     "url": upstream_url,
                     "status": upstream.status_code,
                     "stream": True,
@@ -361,8 +380,12 @@ async def relay(request: Request, upstream_url: str) -> Response:
         else:
             logged_body = mask(summarize_jsonrpc(raw)) or doc
 
+    ended = time.time()
     log({
         "dir": "response",
+        "exchange_id": exchange_id,
+        "ended": ended,
+        "duration_ms": round((ended - t0) * 1000, 1),
         "url": upstream_url,
         "status": upstream.status_code,
         "content_type": ctype,
@@ -445,7 +468,7 @@ async def handle_authorize(request: Request) -> Response:
     ]
     parts = urlsplit(_real_authorization_endpoint)
     target = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(patched), ""))
-    log({"dir": "request", "method": "GET", "url": target,
+    log({"dir": "request", "exchange_id": next(_exchange_ids), "method": "GET", "url": target,
          "note": "authorize redirect-bounce; browser continues directly from here"})
     return Response(status_code=302, headers={"Location": target})
 
