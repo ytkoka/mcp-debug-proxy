@@ -58,6 +58,13 @@ UPSTREAM=https://mcp.example.com/mcp uvicorn proxy:app --port 8080
 
 Then point the MCP client at `http://localhost:8080/`.
 
+`/` is the live MCP endpoint itself (that's what an MCP client actually
+POSTs/GETs its JSON-RPC to) — pointing a plain browser at it isn't a debug
+view, it's a real protocol request, and most upstream MCP servers will
+reject a bare browser GET there (405/406, not a proxy bug). For a browser,
+go to `http://localhost:8080/ui` instead (printed on every startup) — see
+[Live debug UI](#live-debug-ui).
+
 The `UPSTREAM` may be **https** — the proxy connects to it over TLS via
 httpx. Only the proxy's own listener is plain http on localhost, which is
 what the local bridge below expects. By default uvicorn binds to
@@ -287,6 +294,11 @@ values the client actually sent are replaced.
 - **Single upstream** for the root path. Multi-server fan-out would need a
   routing table.
 - **Log rotation / redaction policy** is not implemented.
+- **Graceful shutdown waits for open `/events` connections.** A browser tab
+  left open on `/ui` holds a live SSE connection; uvicorn's `Ctrl+C` will
+  print "Waiting for connections to close" and wait for that tab to
+  disconnect rather than exiting immediately. Close the tab first, or press
+  `Ctrl+C` twice to force-quit.
 
 ## Troubleshooting: 502 through the proxy, but the upstream itself is fine
 

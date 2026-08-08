@@ -650,6 +650,13 @@ async def lifespan(app):
     print(f"[mcp-proxy] upstream={UPSTREAM}  public={PROXY_PUBLIC}  log={LOG_PATH}")
     print("[mcp-proxy] run with a single worker (the default) -- the /_up "
           "allowlist is in-process state and is not shared across workers")
+    # Printed unconditionally (not just when OPEN_UI is set) -- `/` is the
+    # live MCP endpoint itself (real clients POST/GET their JSON-RPC there),
+    # so a browser pointed at the bare PROXY_PUBLIC root gets whatever the
+    # upstream MCP server does with a bare browser GET (often a 405/406,
+    # not the debug UI). Spelling out the /ui URL here heads off exactly
+    # that mix-up.
+    print(f"[mcp-proxy] live UI: {PROXY_PUBLIC}/ui" + (" (opening...)" if OPEN_UI else ""))
     if OPEN_UI:
         # Best-effort: a headless box with no browser/DISPLAY shouldn't take
         # the server down over this. uvicorn has already bound the listening
